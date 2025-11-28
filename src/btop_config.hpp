@@ -50,7 +50,7 @@ namespace Config {
 #endif
 		};
 	const vector<string> temp_scales = { "celsius", "fahrenheit", "kelvin", "rankine" };
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 	const vector<string> freq_modes = { "first", "range", "lowest", "highest", "average" };
 #endif
 #ifdef GPU_SUPPORT

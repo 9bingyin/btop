@@ -62,6 +62,8 @@ tab-size = 4
 #include <string_view>
 #include <unordered_set>
 
+#include <fmt/format.h>
+
 #include "../btop_config.hpp"
 #include "../btop_shared.hpp"
 #include "../btop_tools.hpp"
@@ -76,6 +78,29 @@ using std::ifstream, std::numeric_limits, std::streamsize, std::round, std::max,
 namespace fs = std::filesystem;
 namespace rng = std::ranges;
 using namespace Tools;
+
+//? ------------------------------------------------- IOReport API ----------------------------------------------------
+// IOReport API declarations for Apple Silicon metrics (shared by Gpu and Cpu namespaces)
+namespace {
+	struct IOReportSubscription;
+	using IOReportSubscriptionRef = IOReportSubscription*;
+
+	extern "C" {
+		CFDictionaryRef IOReportCopyChannelsInGroup(CFStringRef, CFStringRef, uint64_t, uint64_t, uint64_t);
+		void IOReportMergeChannels(CFDictionaryRef, CFDictionaryRef, CFTypeRef);
+		IOReportSubscriptionRef IOReportCreateSubscription(const void*, CFMutableDictionaryRef, CFMutableDictionaryRef*, uint64_t, CFTypeRef);
+		CFDictionaryRef IOReportCreateSamples(IOReportSubscriptionRef, CFMutableDictionaryRef, CFTypeRef);
+		CFDictionaryRef IOReportCreateSamplesDelta(CFDictionaryRef, CFDictionaryRef, CFTypeRef);
+		CFStringRef IOReportChannelGetGroup(CFDictionaryRef);
+		CFStringRef IOReportChannelGetSubGroup(CFDictionaryRef);
+		CFStringRef IOReportChannelGetChannelName(CFDictionaryRef);
+		CFStringRef IOReportChannelGetUnitLabel(CFDictionaryRef);
+		int IOReportStateGetCount(CFDictionaryRef);
+		CFStringRef IOReportStateGetNameForIndex(CFDictionaryRef, int);
+		long long IOReportStateGetResidency(CFDictionaryRef, int);
+		long long IOReportSimpleGetIntegerValue(CFDictionaryRef, int);
+	}
+}
 
 //? --------------------------------------------------- FUNCTIONS -----------------------------------------------------
 
@@ -117,25 +142,6 @@ namespace Gpu {
 
 	namespace {
 		using steady_clock = std::chrono::steady_clock;
-
-		struct IOReportSubscription;
-		using IOReportSubscriptionRef = IOReportSubscription*;
-
-		extern "C" {
-			CFDictionaryRef IOReportCopyChannelsInGroup(CFStringRef, CFStringRef, uint64_t, uint64_t, uint64_t);
-			void IOReportMergeChannels(CFDictionaryRef, CFDictionaryRef, CFTypeRef);
-			IOReportSubscriptionRef IOReportCreateSubscription(const void*, CFMutableDictionaryRef, CFMutableDictionaryRef*, uint64_t, CFTypeRef);
-			CFDictionaryRef IOReportCreateSamples(IOReportSubscriptionRef, CFMutableDictionaryRef, CFTypeRef);
-			CFDictionaryRef IOReportCreateSamplesDelta(CFDictionaryRef, CFDictionaryRef, CFTypeRef);
-			CFStringRef IOReportChannelGetGroup(CFDictionaryRef);
-			CFStringRef IOReportChannelGetSubGroup(CFDictionaryRef);
-			CFStringRef IOReportChannelGetChannelName(CFDictionaryRef);
-			CFStringRef IOReportChannelGetUnitLabel(CFDictionaryRef);
-			int IOReportStateGetCount(CFDictionaryRef);
-			CFStringRef IOReportStateGetNameForIndex(CFDictionaryRef, int);
-			long long IOReportStateGetResidency(CFDictionaryRef, int);
-			long long IOReportSimpleGetIntegerValue(CFDictionaryRef, int);
-		}
 
 		std::string cf_to_string(CFStringRef str) {
 			if (str == nullptr) return {};
@@ -730,6 +736,232 @@ namespace Cpu {
 		{"idle", 0}
 	};
 
+	// Apple Silicon CPU frequency support via IOReport
+	namespace {
+		using steady_clock = std::chrono::steady_clock;
+
+		std::string cpu_cf_to_string(CFStringRef str) {
+			if (str == nullptr) return {};
+			char buffer[256];
+			if (CFStringGetCString(str, buffer, sizeof(buffer), kCFStringEncodingUTF8)) {
+				return {buffer};
+			}
+			return {};
+		}
+
+		std::vector<std::pair<std::string, long long>> cpu_get_residencies(CFDictionaryRef item) {
+			const auto count = IOReportStateGetCount(item);
+			std::vector<std::pair<std::string, long long>> residencies;
+			residencies.reserve(count);
+			for (int i = 0; i < count; ++i) {
+				auto* name = IOReportStateGetNameForIndex(item, i);
+				residencies.emplace_back(cpu_cf_to_string(name), IOReportStateGetResidency(item, i));
+			}
+			return residencies;
+		}
+
+		std::pair<uint32_t, long long> cpu_calc_freq(
+			const std::vector<std::pair<std::string, long long>>& residencies,
+			const std::vector<uint32_t>& freqs
+		) {
+			if (residencies.empty() || freqs.empty()) return {0, 0};
+
+			size_t offset = 0;
+			for (; offset < residencies.size(); ++offset) {
+				if (residencies[offset].first != "IDLE" && residencies[offset].first != "DOWN" && residencies[offset].first != "OFF") break;
+			}
+
+			const auto total = std::accumulate(residencies.begin(), residencies.end(), 0.0, [](double acc, const auto& item) {
+				return acc + static_cast<double>(item.second);
+			});
+			const auto active = std::accumulate(residencies.begin() + static_cast<long>(offset), residencies.end(), 0.0, [](double acc, const auto& item) {
+				return acc + static_cast<double>(item.second);
+			});
+
+			if (active <= 0.0 || total <= 0.0) return {0, 0};
+
+			const auto count = std::min(freqs.size(), residencies.size() - offset);
+			double avg_freq = 0.0;
+			for (size_t i = 0; i < count; ++i) {
+				const auto share = static_cast<double>(residencies[offset + i].second) / active;
+				avg_freq += share * static_cast<double>(freqs.at(i));
+			}
+
+			return {static_cast<uint32_t>(std::lround(avg_freq)), 0};
+		}
+
+		// Check if running on M4 or later chip (uses KHz instead of Hz for frequency data)
+		bool is_apple_m4_or_later() {
+			char buffer[256];
+			size_t size = sizeof(buffer);
+			if (sysctlbyname("machdep.cpu.brand_string", buffer, &size, nullptr, 0) == 0) {
+				std::string_view cpu_name(buffer);
+				// M1, M2, M3 use Hz; M4 and later use KHz
+				if (cpu_name.find("M1") != std::string_view::npos ||
+				    cpu_name.find("M2") != std::string_view::npos ||
+				    cpu_name.find("M3") != std::string_view::npos) {
+					return false;
+				}
+				// M4 or later (or unknown Apple Silicon)
+				if (cpu_name.find("Apple") != std::string_view::npos) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		bool cpu_extract_freq_property(io_registry_entry_t entry, const char* key, std::vector<uint32_t>& out, uint32_t scale) {
+			CFMutableDictionaryRef props = nullptr;
+			if (IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) != KERN_SUCCESS || props == nullptr) return false;
+
+			auto cf_key = CFStringCreateWithCString(kCFAllocatorDefault, key, kCFStringEncodingUTF8);
+			auto* value = static_cast<CFDataRef>(CFDictionaryGetValue(props, cf_key));
+			CFRelease(cf_key);
+
+			if (value == nullptr) {
+				CFRelease(props);
+				return false;
+			}
+
+			const auto len = CFDataGetLength(value);
+			if (len <= 0 || (len % 8) != 0) {
+				CFRelease(props);
+				return false;
+			}
+
+			std::vector<uint8_t> bytes(len);
+			CFDataGetBytes(value, CFRangeMake(0, len), bytes.data());
+			CFRelease(props);
+
+			const auto cnt = static_cast<size_t>(len / 8);
+			out.reserve(cnt);
+			for (size_t i = 0; i < cnt; ++i) {
+				const auto off = i * 8;
+				uint32_t freq = static_cast<uint32_t>(bytes[off])
+					| (static_cast<uint32_t>(bytes[off + 1]) << 8u)
+					| (static_cast<uint32_t>(bytes[off + 2]) << 16u)
+					| (static_cast<uint32_t>(bytes[off + 3]) << 24u);
+				out.push_back(freq / scale); // Convert to MHz
+			}
+			return true;
+		}
+
+		std::vector<uint32_t> read_cpu_freqs(const char* voltage_key, uint32_t scale) {
+			std::vector<uint32_t> freqs;
+			auto match = IOServiceMatching("AppleARMIODevice");
+			if (match == nullptr) return freqs;
+
+			io_iterator_t iterator = IO_OBJECT_NULL;
+			if (IOServiceGetMatchingServices(kIOMainPortDefault, match, &iterator) != KERN_SUCCESS) return freqs;
+
+			io_object_t entry = IO_OBJECT_NULL;
+			while ((entry = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+				char name[128] = {};
+				if (IORegistryEntryGetName(entry, name) == KERN_SUCCESS) {
+					if (std::string_view(name) == "pmgr") {
+						if (cpu_extract_freq_property(entry, voltage_key, freqs, scale)) {
+							IOObjectRelease(entry);
+							break;
+						}
+					}
+				}
+				IOObjectRelease(entry);
+			}
+			if (iterator != IO_OBJECT_NULL) IOObjectRelease(iterator);
+			return freqs;
+		}
+
+		class CpuFreqIOReport {
+		public:
+			CpuFreqIOReport() = default;
+			~CpuFreqIOReport() {
+				if (prev_sample != nullptr) CFRelease(prev_sample);
+				if (chan != nullptr) CFRelease(chan);
+			}
+
+			bool init() {
+				if (subs != nullptr) return true;
+
+				// Determine scale factor based on chip generation
+				// M1/M2/M3: frequency data is in Hz, divide by 1,000,000
+				// M4+: frequency data is in KHz, divide by 1,000
+				const uint32_t scale = is_apple_m4_or_later() ? 1'000u : 1'000'000u;
+
+				// Read E-core and P-core frequency tables
+				ecpu_freqs = read_cpu_freqs("voltage-states1-sram", scale);
+				pcpu_freqs = read_cpu_freqs("voltage-states5-sram", scale);
+
+				if (ecpu_freqs.empty() && pcpu_freqs.empty()) {
+					Logger::debug("CPU frequency tables not found (not Apple Silicon?)");
+					return false;
+				}
+
+				// Subscribe to CPU Stats
+				auto* cpu_group = CFStringCreateWithCString(kCFAllocatorDefault, "CPU Stats", kCFStringEncodingUTF8);
+				auto* cpu_stats = IOReportCopyChannelsInGroup(cpu_group, nullptr, 0, 0, 0);
+				CFRelease(cpu_group);
+
+				if (cpu_stats == nullptr) {
+					Logger::debug("Failed to get CPU Stats IOReport channels");
+					return false;
+				}
+
+				chan = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, CFDictionaryGetCount(cpu_stats), cpu_stats);
+				CFRelease(cpu_stats);
+
+				CFMutableDictionaryRef subscribed = nullptr;
+				subs = IOReportCreateSubscription(nullptr, chan, &subscribed, 0, nullptr);
+				if (subscribed != nullptr) CFRelease(subscribed);
+
+				if (subs == nullptr) {
+					CFRelease(chan);
+					chan = nullptr;
+					Logger::debug("Failed to create CPU IOReport subscription");
+					return false;
+				}
+
+				prev_sample = IOReportCreateSamples(subs, chan, nullptr);
+				prev_time = steady_clock::now();
+
+				Logger::debug("CPU frequency IOReport initialized");
+				return prev_sample != nullptr;
+			}
+
+			bool next(CFDictionaryRef& out, uint64_t& elapsed_ms) {
+				if (subs == nullptr || chan == nullptr) return false;
+
+				auto* current = IOReportCreateSamples(subs, chan, nullptr);
+				if (current == nullptr) return false;
+
+				const auto now = steady_clock::now();
+				elapsed_ms = std::max<uint64_t>(1, std::chrono::duration_cast<std::chrono::milliseconds>(now - prev_time).count());
+				prev_time = now;
+
+				auto* delta = IOReportCreateSamplesDelta(prev_sample, current, nullptr);
+				CFRelease(prev_sample);
+				prev_sample = current;
+
+				if (delta == nullptr) return false;
+				out = delta;
+				return true;
+			}
+
+			std::vector<uint32_t> ecpu_freqs;
+			std::vector<uint32_t> pcpu_freqs;
+
+		private:
+			IOReportSubscriptionRef subs = nullptr;
+			CFMutableDictionaryRef chan = nullptr;
+			CFDictionaryRef prev_sample = nullptr;
+			steady_clock::time_point prev_time = steady_clock::now();
+		};
+
+		CpuFreqIOReport cpu_freq_report;
+		uint32_t current_ecpu_freq = 0;
+		uint32_t current_pcpu_freq = 0;
+		bool cpu_freq_initialized = false;
+	}  // namespace
+
 	string get_cpuName() {
 		string name;
 		char buffer[1024];
@@ -818,14 +1050,81 @@ namespace Cpu {
 		}
 	}
 
+	// Helper to format frequency for display
+	string format_freq(uint32_t freq_mhz) {
+		if (freq_mhz >= 1000) {
+			double ghz = freq_mhz / 1000.0;
+			return fmt::format("{:.2f} GHz", ghz);
+		}
+		return fmt::format("{} MHz", freq_mhz);
+	}
+
+	// Collect CPU frequency from IOReport (called from collect())
+	void collect_cpu_freq() {
+		if (!cpu_freq_initialized) {
+			cpu_freq_initialized = cpu_freq_report.init();
+			if (!cpu_freq_initialized) return;
+		}
+
+		CFDictionaryRef sample = nullptr;
+		uint64_t elapsed_ms = 0;
+		if (!cpu_freq_report.next(sample, elapsed_ms)) return;
+
+		auto* items = static_cast<CFArrayRef>(CFDictionaryGetValue(sample, CFSTR("IOReportChannels")));
+		if (items == nullptr) {
+			CFRelease(sample);
+			return;
+		}
+
+		const auto count = CFArrayGetCount(items);
+		for (CFIndex i = 0; i < count; ++i) {
+			auto* item = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(items, i));
+			auto group = cpu_cf_to_string(IOReportChannelGetGroup(item));
+			auto subgroup = cpu_cf_to_string(IOReportChannelGetSubGroup(item));
+			auto channel = cpu_cf_to_string(IOReportChannelGetChannelName(item));
+
+			if (group == "CPU Stats" && subgroup == "CPU Core Performance States") {
+				if (channel.starts_with("ECPU")) {
+					auto residencies = cpu_get_residencies(item);
+					auto [freq, _] = cpu_calc_freq(residencies, cpu_freq_report.ecpu_freqs);
+					if (freq > 0) current_ecpu_freq = freq;
+				}
+				else if (channel.starts_with("PCPU")) {
+					auto residencies = cpu_get_residencies(item);
+					auto [freq, _] = cpu_calc_freq(residencies, cpu_freq_report.pcpu_freqs);
+					if (freq > 0) current_pcpu_freq = freq;
+				}
+			}
+		}
+		CFRelease(sample);
+	}
+
 	string get_cpuHz() {
+		// Apple Silicon: use IOReport data
+		if (current_pcpu_freq > 0 || current_ecpu_freq > 0) {
+			const auto& freq_mode = Config::getS("freq_mode");
+
+			if (freq_mode == "range" && current_ecpu_freq > 0 && current_pcpu_freq > 0) {
+				return format_freq(current_ecpu_freq) + " - " + format_freq(current_pcpu_freq);
+			}
+			else if (freq_mode == "lowest" && current_ecpu_freq > 0) {
+				return format_freq(current_ecpu_freq);
+			}
+			else if (freq_mode == "average" && current_ecpu_freq > 0 && current_pcpu_freq > 0) {
+				return format_freq((current_ecpu_freq + current_pcpu_freq) / 2);
+			}
+			else {
+				// "highest" or "first" or default: show P-core frequency
+				return format_freq(current_pcpu_freq > 0 ? current_pcpu_freq : current_ecpu_freq);
+			}
+		}
+
+		// Intel Mac: use sysctl
 		unsigned int freq = 1;
 		size_t size = sizeof(freq);
-
 		int mib[] = {CTL_HW, HW_CPU_FREQ};
 
 		if (sysctl(mib, 2, &freq, &size, nullptr, 0) < 0) {
-			// this fails on Apple Silicon macs. Apparently you're not allowed to know
 			return "";
 		}
 		return std::to_string(freq / 1000.0 / 1000.0 / 1000.0).substr(0, 3);
@@ -1027,6 +1326,7 @@ namespace Cpu {
 		while (cmp_greater(cpu.cpu_percent.at("total").size(), width * 2)) cpu.cpu_percent.at("total").pop_front();
 
 		if (Config::getB("show_cpu_freq")) {
+			collect_cpu_freq();  // Update CPU frequency from IOReport (Apple Silicon)
 			auto hz = get_cpuHz();
 			if (hz != "") {
 				cpuHz = hz;
