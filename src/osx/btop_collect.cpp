@@ -399,6 +399,14 @@ namespace Gpu {
 		std::vector<uint32_t> gpu_perf_states = {};
 		std::string gpu_name;
 		long long default_pwr_ceiling = 30'000; // 30W baseline for percent calculations
+
+		// GPU temperature support
+		std::unique_ptr<Cpu::SMCConnection> gpu_smc;
+		bool use_smc_for_gpu_temp = false;
+#if __MAC_OS_X_VERSION_MIN_REQUIRED > 101504
+		std::unique_ptr<Cpu::ThermalSensors> gpu_hid_sensors;
+		bool use_hid_for_gpu_temp = false;
+#endif
 	}  // namespace
 
 	bool init() {
@@ -430,12 +438,69 @@ namespace Gpu {
 		gpu.supported_functions.mem_clock = false;
 		gpu.supported_functions.pwr_usage = true;
 		gpu.supported_functions.pwr_state = false;
-		gpu.supported_functions.temp_info = false;
 		gpu.supported_functions.mem_total = false;
 		gpu.supported_functions.mem_used = false;
 		gpu.supported_functions.pcie_txrx = false;
 		gpu.supported_functions.encoder_utilization = false;
 		gpu.supported_functions.decoder_utilization = false;
+
+		// Initialize gpu_percent deques with initial values to prevent empty deque access
+		gpu.gpu_percent.at("gpu-totals").push_back(0);
+		gpu.gpu_percent.at("gpu-pwr-totals").push_back(0);
+		gpu.gpu_clock_speed = 0;
+
+		// Initialize GPU temperature support
+		// Try SMC first (works on M2/M3/M4 and macOS 14+)
+		try {
+			auto smc = std::make_unique<Cpu::SMCConnection>();
+			if (smc->hasGpuTempKeys()) {
+				gpu_smc = std::move(smc);
+				use_smc_for_gpu_temp = true;
+				gpu.supported_functions.temp_info = true;
+				Logger::debug("GPU temperature: using SMC");
+			}
+		} catch (const std::exception& e) {
+			Logger::debug("SMC GPU temperature init failed: " + std::string(e.what()));
+		}
+
+#if __MAC_OS_X_VERSION_MIN_REQUIRED > 101504
+		// Fall back to IOHID sensors (works on M1)
+		if (!use_smc_for_gpu_temp) {
+			try {
+				gpu_hid_sensors = std::make_unique<Cpu::ThermalSensors>();
+				// Test if we can get GPU temp
+				long long test_temp = gpu_hid_sensors->getGpuTemp();
+				if (test_temp > 0) {
+					use_hid_for_gpu_temp = true;
+					gpu.supported_functions.temp_info = true;
+					Logger::debug("GPU temperature: using IOHID sensors");
+				}
+			} catch (const std::exception& e) {
+				Logger::debug("IOHID GPU temperature init failed: " + std::string(e.what()));
+			}
+		}
+#endif
+
+		if (!gpu.supported_functions.temp_info) {
+			gpu.supported_functions.temp_info = false;
+			Logger::debug("GPU temperature monitoring not available");
+		}
+
+		// Get initial temperature reading
+		if (gpu.supported_functions.temp_info) {
+			long long temp = 0;
+			if (use_smc_for_gpu_temp && gpu_smc) {
+				temp = gpu_smc->getGpuTemp();
+			}
+#if __MAC_OS_X_VERSION_MIN_REQUIRED > 101504
+			else if (use_hid_for_gpu_temp && gpu_hid_sensors) {
+				temp = gpu_hid_sensors->getGpuTemp();
+			}
+#endif
+			if (temp > 0) {
+				gpu.temp.push_back(temp);
+			}
+		}
 
 		return true;
 	}
@@ -487,6 +552,22 @@ namespace Gpu {
 				}
 			}
 		}
+
+		// Collect GPU temperature
+		if (use_smc_for_gpu_temp && gpu_smc) {
+			long long temp = gpu_smc->getGpuTemp();
+			if (temp > 0) {
+				gpu.temp.push_back(temp);
+			}
+		}
+#if __MAC_OS_X_VERSION_MIN_REQUIRED > 101504
+		else if (use_hid_for_gpu_temp && gpu_hid_sensors) {
+			long long temp = gpu_hid_sensors->getGpuTemp();
+			if (temp > 0) {
+				gpu.temp.push_back(temp);
+			}
+		}
+#endif
 
 		if (gpu.gpu_percent.at("gpu-totals").empty()) gpu.gpu_percent.at("gpu-totals").push_back(0);
 		if (gpu.gpu_percent.at("gpu-pwr-totals").empty()) gpu.gpu_percent.at("gpu-pwr-totals").push_back(0);

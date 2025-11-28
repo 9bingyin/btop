@@ -18,6 +18,9 @@ tab-size = 4
 
 #include "smc.hpp"
 
+#include <cmath>
+#include <numeric>
+
 static constexpr size_t MaxIndexCount = sizeof("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") - 1;
 static constexpr const char *KeyIndexes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -64,6 +67,8 @@ namespace Cpu {
 		if (result != kIOReturnSuccess) {
 			throw std::runtime_error("failed to get SMC connection");
 		}
+
+		findGpuTempKeys();
 	}
 	SMCConnection::~SMCConnection() {
 		IOServiceClose(conn);
@@ -149,6 +154,70 @@ namespace Cpu {
 										 inputStructure, structureInputSize,
 										 // outputStructure
 										 outputStructure, &structureOutputSize);
+	}
+
+	void SMCConnection::findGpuTempKeys() {
+		gpu_temp_keys.clear();
+		// GPU temperature keys start with "Tg" (e.g., Tg0P, Tg0D, Tg0p, Tg1p, etc.)
+		// Common patterns: Tg0P, Tg0p, Tg1p, Tg0D, etc.
+		const char* prefixes[] = {"Tg0P", "Tg0D", "Tg0p", "Tg1p", "Tg2p", "Tg3p", "Tg4p", "Tg5p", "Tg6p", "Tg7p", "Tg8p", "Tg9p"};
+
+		for (const auto& prefix : prefixes) {
+			SMCVal_t val;
+			char key[5];
+			snprintf(key, 5, "%s", prefix);
+			kern_return_t result = SMCReadKey(key, &val);
+			if (result == kIOReturnSuccess && val.dataSize > 0) {
+				// Check if it's a float type (flt ) or sp78 type
+				if (strcmp(val.dataType, DATATYPE_FLT) == 0 || strcmp(val.dataType, DATATYPE_SP78) == 0) {
+					gpu_temp_keys.push_back(std::string(key));
+				}
+			}
+		}
+	}
+
+	float SMCConnection::getSMCFloatTemp(const char *key) {
+		SMCVal_t val;
+		char mutableKey[5];
+		snprintf(mutableKey, 5, "%s", key);
+		kern_return_t result = SMCReadKey(mutableKey, &val);
+		if (result == kIOReturnSuccess && val.dataSize > 0) {
+			if (strcmp(val.dataType, DATATYPE_FLT) == 0 && val.dataSize == 4) {
+				// float type: directly interpret bytes as float (little-endian)
+				float temp;
+				memcpy(&temp, val.bytes, sizeof(float));
+				return temp;
+			} else if (strcmp(val.dataType, DATATYPE_SP78) == 0) {
+				// sp78 type: signed 7.8 fixed point
+				int intValue = val.bytes[0] * 256 + (unsigned char)val.bytes[1];
+				return static_cast<float>(intValue) / 256.0f;
+			}
+		}
+		return -1.0f;
+	}
+
+	long long SMCConnection::getGpuTemp() {
+		if (gpu_temp_keys.empty()) {
+			return 0;
+		}
+
+		std::vector<float> temps;
+		temps.reserve(gpu_temp_keys.size());
+
+		for (const auto& key : gpu_temp_keys) {
+			float temp = getSMCFloatTemp(key.c_str());
+			// Valid temperature range: 0-150 degrees Celsius
+			if (temp > 0.0f && temp < 150.0f) {
+				temps.push_back(temp);
+			}
+		}
+
+		if (temps.empty()) {
+			return 0;
+		}
+
+		float sum = std::accumulate(temps.begin(), temps.end(), 0.0f);
+		return static_cast<long long>(std::round(sum / static_cast<float>(temps.size())));
 	}
 
 }  // namespace Cpu

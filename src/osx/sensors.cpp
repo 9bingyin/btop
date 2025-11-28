@@ -111,4 +111,39 @@ long long Cpu::ThermalSensors::getSensors() {
 	if (temps.empty()) return 0ll;
 	return round(std::accumulate(temps.begin(), temps.end(), 0ll) / temps.size());
 }
+
+long long Cpu::ThermalSensors::getGpuTemp() {
+	CFDictionaryRef thermalSensors = matching(0xff00, 5);  // Same matching as CPU sensors
+	IOHIDEventSystemClientRef system = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+	IOHIDEventSystemClientSetMatching(system, thermalSensors);
+	CFArrayRef matchingsrvs = IOHIDEventSystemClientCopyServices(system);
+	std::vector<double> temps;
+	if (matchingsrvs) {
+		long count = CFArrayGetCount(matchingsrvs);
+		for (int i = 0; i < count; i++) {
+			IOHIDServiceClientRef sc = (IOHIDServiceClientRef)CFArrayGetValueAtIndex(matchingsrvs, i);
+			if (sc) {
+				CFStringRef name = IOHIDServiceClientCopyProperty(sc, CFSTR("Product"));
+				if (name) {
+					char buf[200];
+					CFStringGetCString(name, buf, 200, kCFStringEncodingASCII);
+					std::string n(buf);
+					// GPU temperature sensors are named "GPU MTR Temp Sensor*"
+					if (n.starts_with("GPU MTR Temp Sensor")) {
+						double temp = getValue(sc);
+						if (temp > 0.0 && temp < 150.0) {
+							temps.push_back(temp);
+						}
+					}
+					CFRelease(name);
+				}
+			}
+		}
+		CFRelease(matchingsrvs);
+	}
+	CFRelease(system);
+	CFRelease(thermalSensors);
+	if (temps.empty()) return 0ll;
+	return static_cast<long long>(round(std::accumulate(temps.begin(), temps.end(), 0.0) / static_cast<double>(temps.size())));
+}
 #endif

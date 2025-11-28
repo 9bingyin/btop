@@ -22,6 +22,7 @@ namespace Cpu {
 	class ThermalSensors {
 	   public:
 		long long getSensors();
+		long long getGpuTemp();
 	};
 }  // namespace Cpu
 #endif
