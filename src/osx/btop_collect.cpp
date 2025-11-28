@@ -1050,13 +1050,21 @@ namespace Cpu {
 		}
 	}
 
-	// Helper to format frequency for display
-	string format_freq(uint32_t freq_mhz) {
-		if (freq_mhz >= 1000) {
-			double ghz = freq_mhz / 1000.0;
-			return fmt::format("{:.2f} GHz", ghz);
+	// Match Linux frequency formatting (width expectations: single <= 7 chars, range <= 17)
+	string normalize_frequency(double freq_mhz) {
+		if (freq_mhz > 999'999) {
+			string str = fmt::format("{:.1f}", freq_mhz / 1'000'000.0);
+			str.resize(3);
+			if (str.back() == '.') str.pop_back();
+			return str + " THz";
 		}
-		return fmt::format("{} MHz", freq_mhz);
+		if (freq_mhz > 999) {
+			string str = fmt::format("{:.1f}", freq_mhz / 1000.0);
+			str.resize(3);
+			if (str.back() == '.') str.pop_back();
+			return str + " GHz";
+		}
+		return fmt::format("{:.0f} MHz", freq_mhz);
 	}
 
 	// Collect CPU frequency from IOReport (called from collect())
@@ -1100,34 +1108,46 @@ namespace Cpu {
 	}
 
 	string get_cpuHz() {
-		// Apple Silicon: use IOReport data
-		if (current_pcpu_freq > 0 || current_ecpu_freq > 0) {
-			const auto& freq_mode = Config::getS("freq_mode");
+		std::vector<double> freqs;
+		if (current_ecpu_freq > 0) freqs.push_back(static_cast<double>(current_ecpu_freq));
+		if (current_pcpu_freq > 0) freqs.push_back(static_cast<double>(current_pcpu_freq));
 
-			if (freq_mode == "range" && current_ecpu_freq > 0 && current_pcpu_freq > 0) {
-				return format_freq(current_ecpu_freq) + " - " + format_freq(current_pcpu_freq);
+		const auto& freq_mode = Config::getS("freq_mode");
+		if (not freqs.empty()) {
+			double mhz = 0.0;
+
+			if (freq_mode == "first") {
+				mhz = freqs.front();
 			}
-			else if (freq_mode == "lowest" && current_ecpu_freq > 0) {
-				return format_freq(current_ecpu_freq);
+			if (freq_mode == "average") {
+				mhz = std::accumulate(freqs.begin(), freqs.end(), 0.0) / static_cast<double>(freqs.size());
 			}
-			else if (freq_mode == "average" && current_ecpu_freq > 0 && current_pcpu_freq > 0) {
-				return format_freq((current_ecpu_freq + current_pcpu_freq) / 2);
+			else if (freq_mode == "highest") {
+				mhz = *std::max_element(freqs.begin(), freqs.end());
 			}
-			else {
-				// "highest" or "first" or default: show P-core frequency
-				return format_freq(current_pcpu_freq > 0 ? current_pcpu_freq : current_ecpu_freq);
+			else if (freq_mode == "lowest") {
+				mhz = *std::min_element(freqs.begin(), freqs.end());
+			}
+			else if (freq_mode == "range") {
+				auto [min_hz, max_hz] = std::minmax_element(freqs.begin(), freqs.end());
+				return normalize_frequency(*min_hz) + " - " + normalize_frequency(*max_hz);
+			}
+
+			if (mhz > 0.0) {
+				return normalize_frequency(mhz);
 			}
 		}
 
-		// Intel Mac: use sysctl
-		unsigned int freq = 1;
+		// Intel Mac fallback: use sysctl
+		unsigned int freq = 0;
 		size_t size = sizeof(freq);
 		int mib[] = {CTL_HW, HW_CPU_FREQ};
 
 		if (sysctl(mib, 2, &freq, &size, nullptr, 0) < 0) {
 			return "";
 		}
-		return std::to_string(freq / 1000.0 / 1000.0 / 1000.0).substr(0, 3);
+
+		return normalize_frequency(static_cast<double>(freq) / 1'000'000.0);
 	}
 
 	auto get_core_mapping() -> std::unordered_map<int, int> {

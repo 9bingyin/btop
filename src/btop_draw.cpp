@@ -821,7 +821,7 @@ namespace Cpu {
 					+ Theme::c("graph_text") + "up" + Mv::r(1) + upstr;
 			}
 
-		#ifdef __linux__
+		#if defined(__linux__) || defined(__APPLE__)
 			const bool freq_range = Config::getS("freq_mode") == "range";
 		#else
 			const bool freq_range = false;
@@ -2149,7 +2149,7 @@ namespace Draw {
 
 			auto& custom = Config::getS("custom_cpu_name");
 			static const bool hasCpuHz = not Cpu::get_cpuHz().empty();
-		#ifdef __linux__
+		#if defined(__linux__) || defined(__APPLE__)
 			static const bool freq_range = Config::getS("freq_mode") == "range";
 		#else
 			static const bool freq_range = false;
