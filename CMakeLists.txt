@@ -160,35 +160,39 @@ find_package(Threads REQUIRED)
 target_link_libraries(libbtop Threads::Threads)
 
 # Enable GPU support
-if(LINUX AND BTOP_GPU)
-  target_compile_definitions(libbtop PUBLIC GPU_SUPPORT)
+if(BTOP_GPU)
+  if(LINUX)
+    target_compile_definitions(libbtop PUBLIC GPU_SUPPORT)
 
-  if(BTOP_RSMI_STATIC)
-    # ROCm doesn't properly add it's folders to the module path if `CMAKE_MODULE_PATH` is already
-    # set
-    # We could also manually append ROCm's path here
-    set(_CMAKE_MODULE_PATH CMAKE_MODULE_PATH)
-    unset(CMAKE_MODULE_PATH)
+    if(BTOP_RSMI_STATIC)
+      # ROCm doesn't properly add it's folders to the module path if `CMAKE_MODULE_PATH` is already
+      # set
+      # We could also manually append ROCm's path here
+      set(_CMAKE_MODULE_PATH CMAKE_MODULE_PATH)
+      unset(CMAKE_MODULE_PATH)
 
-    # NOTE: This might be problematic in the future if other sub projects depend on this or if
-    # btop starts producing libraries
-    # Build a static ROCm library
-    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+      # NOTE: This might be problematic in the future if other sub projects depend on this or if
+      # btop starts producing libraries
+      # Build a static ROCm library
+      set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-    add_subdirectory(lib/rocm_smi_lib EXCLUDE_FROM_ALL)
+      add_subdirectory(lib/rocm_smi_lib EXCLUDE_FROM_ALL)
 
-    add_library(ROCm INTERFACE)
-    # Export ROCm's properties to a target
-    target_compile_definitions(ROCm INTERFACE RSMI_STATIC)
-    target_include_directories(ROCm INTERFACE lib/rocm_smi_lib/include)
-    target_link_libraries(ROCm INTERFACE rocm_smi64)
+      add_library(ROCm INTERFACE)
+      # Export ROCm's properties to a target
+      target_compile_definitions(ROCm INTERFACE RSMI_STATIC)
+      target_include_directories(ROCm INTERFACE lib/rocm_smi_lib/include)
+      target_link_libraries(ROCm INTERFACE rocm_smi64)
 
-    set(CMAKE_MODULE_PATH _CMAKE_MODULE_PATH)
+      set(CMAKE_MODULE_PATH _CMAKE_MODULE_PATH)
 
-    target_link_libraries(libbtop ROCm)
-  endif()
-  if(NOT BTOP_STATIC)
-    target_link_libraries(libbtop ${CMAKE_DL_LIBS})
+      target_link_libraries(libbtop ROCm)
+    endif()
+    if(NOT BTOP_STATIC)
+      target_link_libraries(libbtop ${CMAKE_DL_LIBS})
+    endif()
+  elseif(APPLE)
+    target_compile_definitions(libbtop PUBLIC GPU_SUPPORT)
   endif()
 endif()
 
@@ -202,6 +206,9 @@ if(APPLE)
   target_link_libraries(libbtop
     $<LINK_LIBRARY:FRAMEWORK,CoreFoundation> $<LINK_LIBRARY:FRAMEWORK,IOKit>
   )
+  if(BTOP_GPU)
+    target_link_libraries(libbtop IOReport)
+  endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "MidnightBSD")
   # Avoid version mismatch for libstdc++ when a specific version of GCC is installed and not the
   # default one since all use the default ones RPATH

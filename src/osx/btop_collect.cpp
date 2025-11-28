@@ -47,13 +47,19 @@ tab-size = 4
 #include <stdexcept>
 #include <utility>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <ranges>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 
 #include "../btop_config.hpp"
@@ -103,6 +109,422 @@ namespace Cpu {
 	vector<string> core_sensors;
 	std::unordered_map<int, int> core_mapping;
 }  // namespace Cpu
+
+#ifdef GPU_SUPPORT
+namespace Gpu {
+
+	vector<gpu_info> gpus;
+
+	namespace {
+		using steady_clock = std::chrono::steady_clock;
+
+		struct IOReportSubscription;
+		using IOReportSubscriptionRef = IOReportSubscription*;
+
+		extern "C" {
+			CFDictionaryRef IOReportCopyChannelsInGroup(CFStringRef, CFStringRef, uint64_t, uint64_t, uint64_t);
+			void IOReportMergeChannels(CFDictionaryRef, CFDictionaryRef, CFTypeRef);
+			IOReportSubscriptionRef IOReportCreateSubscription(const void*, CFMutableDictionaryRef, CFMutableDictionaryRef*, uint64_t, CFTypeRef);
+			CFDictionaryRef IOReportCreateSamples(IOReportSubscriptionRef, CFMutableDictionaryRef, CFTypeRef);
+			CFDictionaryRef IOReportCreateSamplesDelta(CFDictionaryRef, CFDictionaryRef, CFTypeRef);
+			CFStringRef IOReportChannelGetGroup(CFDictionaryRef);
+			CFStringRef IOReportChannelGetSubGroup(CFDictionaryRef);
+			CFStringRef IOReportChannelGetChannelName(CFDictionaryRef);
+			CFStringRef IOReportChannelGetUnitLabel(CFDictionaryRef);
+			int IOReportStateGetCount(CFDictionaryRef);
+			CFStringRef IOReportStateGetNameForIndex(CFDictionaryRef, int);
+			long long IOReportStateGetResidency(CFDictionaryRef, int);
+			long long IOReportSimpleGetIntegerValue(CFDictionaryRef, int);
+		}
+
+		std::string cf_to_string(CFStringRef str) {
+			if (str == nullptr) return {};
+
+			char buffer[256];
+			if (CFStringGetCString(str, buffer, sizeof(buffer), kCFStringEncodingUTF8)) {
+				return {buffer};
+			}
+
+			const auto len = CFStringGetLength(str);
+			const auto max_size = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+			std::string out(max_size, '\0');
+			if (CFStringGetCString(str, out.data(), max_size, kCFStringEncodingUTF8)) {
+				return {out.c_str()};
+			}
+			return {};
+		}
+
+		CFStringRef make_cf_string(const std::string& value) {
+			return CFStringCreateWithCString(kCFAllocatorDefault, value.c_str(), kCFStringEncodingUTF8);
+		}
+
+		std::vector<std::pair<std::string, long long>> get_residencies(CFDictionaryRef item) {
+			const auto count = IOReportStateGetCount(item);
+			std::vector<std::pair<std::string, long long>> residencies;
+			residencies.reserve(count);
+
+			for (int i = 0; i < count; ++i) {
+				auto* name = IOReportStateGetNameForIndex(item, i);
+				residencies.emplace_back(cf_to_string(name), IOReportStateGetResidency(item, i));
+			}
+
+			return residencies;
+		}
+
+		std::pair<unsigned int, long long> calc_freq(
+			const std::vector<std::pair<std::string, long long>>& residencies,
+			const std::vector<uint32_t>& freqs
+		) {
+			if (residencies.empty()) return {0, 0};
+
+			size_t offset = 0;
+			for (; offset < residencies.size(); ++offset) {
+				if (residencies[offset].first != "IDLE" and residencies[offset].first != "DOWN" and residencies[offset].first != "OFF") break;
+			}
+
+			const auto total = std::accumulate(residencies.begin(), residencies.end(), 0.0, [](double acc, const auto& item) {
+				return acc + static_cast<double>(item.second);
+			});
+			const auto active = std::accumulate(residencies.begin() + static_cast<long>(offset), residencies.end(), 0.0, [](double acc, const auto& item) {
+				return acc + static_cast<double>(item.second);
+			});
+
+			if (active <= 0.0 or total <= 0.0) return {0, 0};
+
+			const auto count = std::min(freqs.size(), residencies.size() - offset);
+			double avg_freq = 0.0;
+			for (size_t i = 0; i < count; ++i) {
+				const auto share = static_cast<double>(residencies[offset + i].second) / active;
+				avg_freq += share * static_cast<double>(freqs.at(i));
+			}
+
+			const auto usage_ratio = active / total;
+			const auto min_freq = freqs.empty() ? 0.0 : static_cast<double>(freqs.front());
+			const auto max_freq = freqs.empty() ? 0.0 : static_cast<double>(freqs.back());
+			const auto freq = std::max(avg_freq, min_freq);
+			const auto percent = (max_freq > 0.0) ? static_cast<long long>(std::llround((freq * usage_ratio / max_freq) * 100.0))
+												 : static_cast<long long>(std::llround(usage_ratio * 100.0));
+
+			return {static_cast<unsigned int>(std::lround(freq)), clamp(percent, 0ll, 100ll)};
+		}
+
+		long long energy_to_mw(CFDictionaryRef item, const std::string& unit, uint64_t elapsed_ms) {
+			if (elapsed_ms == 0) return -1;
+
+			const auto val = static_cast<double>(IOReportSimpleGetIntegerValue(item, 0));
+			const auto seconds = static_cast<double>(elapsed_ms) / 1000.0;
+			double watts = 0.0;
+
+			if (unit == "mJ") watts = val / 1000.0 / seconds;
+			else if (unit == "uJ") watts = val / 1'000'000.0 / seconds;
+			else if (unit == "nJ") watts = val / 1'000'000'000.0 / seconds;
+			else return -1;
+
+			return static_cast<long long>(std::llround(watts * 1000.0));
+		}
+
+		bool extract_freq_property(io_registry_entry_t entry, const char* key, std::vector<uint32_t>& out) {
+			CFMutableDictionaryRef props = nullptr;
+			if (IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) != KERN_SUCCESS or props == nullptr) return false;
+
+			const auto cf_key = make_cf_string(key);
+			auto* value = static_cast<CFDataRef>(CFDictionaryGetValue(props, cf_key));
+			CFRelease(cf_key);
+
+			if (value == nullptr) {
+				CFRelease(props);
+				return false;
+			}
+
+			const auto len = CFDataGetLength(value);
+			if (len <= 0 or (len % 8) != 0) {
+				CFRelease(props);
+				return false;
+			}
+
+			std::vector<uint8_t> bytes(len);
+			CFDataGetBytes(value, CFRangeMake(0, len), bytes.data());
+			CFRelease(props);
+
+			const auto count = static_cast<size_t>(len / 8);
+			out.reserve(count);
+			for (size_t i = 0; i < count; ++i) {
+				const auto offset = i * 8;
+				uint32_t freq = static_cast<uint32_t>(bytes[offset])
+					| (static_cast<uint32_t>(bytes[offset + 1]) << 8u)
+					| (static_cast<uint32_t>(bytes[offset + 2]) << 16u)
+					| (static_cast<uint32_t>(bytes[offset + 3]) << 24u);
+				out.push_back(freq / 1'000'000u); // Hz -> MHz
+			}
+			return true;
+		}
+
+		std::vector<uint32_t> read_gpu_freqs() {
+			std::vector<uint32_t> freqs;
+
+			auto match = IOServiceMatching("AppleARMIODevice");
+			if (match == nullptr) return freqs;
+
+			io_iterator_t iterator = IO_OBJECT_NULL;
+			if (IOServiceGetMatchingServices(kIOMainPortDefault, match, &iterator) != KERN_SUCCESS) return freqs;
+
+			io_object_t entry = IO_OBJECT_NULL;
+			while ((entry = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+				char name[128] = {};
+				if (IORegistryEntryGetName(entry, name) == KERN_SUCCESS) {
+					if (std::string_view(name) == "pmgr") {
+						if (extract_freq_property(entry, "voltage-states9", freqs)) {
+							IOObjectRelease(entry);
+							break;
+						}
+					}
+				}
+				IOObjectRelease(entry);
+			}
+
+			if (iterator != IO_OBJECT_NULL) IOObjectRelease(iterator);
+			return freqs;
+		}
+
+		std::string detect_gpu_name() {
+			std::string result;
+			FILE* fp = popen("system_profiler SPDisplaysDataType | grep \"Chipset Model\" | head -n1", "r");
+			if (fp != nullptr) {
+				char buffer[256];
+				while (fgets(buffer, sizeof(buffer), fp) != nullptr) {
+					result += buffer;
+				}
+				pclose(fp);
+			}
+
+			if (auto pos = result.find(':'); pos != std::string::npos) {
+				result = trim(result.substr(pos + 1));
+			} else {
+				result = trim(result);
+			}
+
+			if (result.empty()) result = "Apple GPU";
+			return result;
+		}
+
+		CFMutableDictionaryRef build_channel_set() {
+			std::vector<CFDictionaryRef> channels;
+			auto* gpu_group = make_cf_string("GPU Stats");
+			auto* gpu_subgroup = make_cf_string("GPU Performance States");
+			if (auto* chan = IOReportCopyChannelsInGroup(gpu_group, gpu_subgroup, 0, 0, 0)) channels.push_back(chan);
+			CFRelease(gpu_group);
+			CFRelease(gpu_subgroup);
+
+			auto* energy_group = make_cf_string("Energy Model");
+			if (auto* chan = IOReportCopyChannelsInGroup(energy_group, nullptr, 0, 0, 0)) channels.push_back(chan);
+			CFRelease(energy_group);
+
+			if (channels.empty()) return nullptr;
+
+			auto* merged = channels.front();
+			for (size_t i = 1; i < channels.size(); ++i) IOReportMergeChannels(merged, channels.at(i), nullptr);
+
+			const auto size = CFDictionaryGetCount(merged);
+			auto* mutable_copy = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, size, merged);
+
+			for (auto* chan : channels) {
+				CFRelease(chan);
+			}
+
+			if (CFDictionaryGetValue(mutable_copy, CFSTR("IOReportChannels")) == nullptr) {
+				CFRelease(mutable_copy);
+				return nullptr;
+			}
+
+			return mutable_copy;
+		}
+
+		class IOReportContext {
+		public:
+			IOReportContext() = default;
+			~IOReportContext() {
+				if (prev_sample != nullptr) CFRelease(prev_sample);
+				if (chan != nullptr) CFRelease(chan);
+				if (subs != nullptr) CFRelease(subs);
+			}
+
+			bool init() {
+				if (subs != nullptr) return true;
+				chan = build_channel_set();
+				if (chan == nullptr) return false;
+
+				CFMutableDictionaryRef subscribed = nullptr;
+				subs = IOReportCreateSubscription(nullptr, chan, &subscribed, 0, nullptr);
+				if (subscribed != nullptr) CFRelease(subscribed);
+				if (subs == nullptr) {
+					CFRelease(chan);
+					chan = nullptr;
+					return false;
+				}
+
+				prev_sample = IOReportCreateSamples(subs, chan, nullptr);
+				prev_time = steady_clock::now();
+				return prev_sample != nullptr;
+			}
+
+			bool next(CFDictionaryRef& out, uint64_t& elapsed_ms) {
+				if (subs == nullptr or chan == nullptr) return false;
+
+				auto* current = IOReportCreateSamples(subs, chan, nullptr);
+				if (current == nullptr) return false;
+
+				const auto now = steady_clock::now();
+				const auto diff_ms = std::max<uint64_t>(1, std::chrono::duration_cast<std::chrono::milliseconds>(now - prev_time).count());
+				prev_time = now;
+
+				auto* delta = IOReportCreateSamplesDelta(prev_sample, current, nullptr);
+				CFRelease(prev_sample);
+				prev_sample = current;
+
+				if (delta == nullptr) return false;
+				out = delta;
+				elapsed_ms = diff_ms;
+				return true;
+			}
+
+		private:
+			IOReportSubscriptionRef subs = nullptr;
+			CFMutableDictionaryRef chan = nullptr;
+			CFDictionaryRef prev_sample = nullptr;
+			steady_clock::time_point prev_time = steady_clock::now();
+		};
+
+		IOReportContext io_report;
+		std::vector<uint32_t> gpu_freqs = {};
+		std::vector<uint32_t> gpu_perf_states = {};
+		std::string gpu_name;
+		long long default_pwr_ceiling = 30'000; // 30W baseline for percent calculations
+	}  // namespace
+
+	bool init() {
+		if (!io_report.init()) {
+			Logger::warning("IOReport GPU subscription unavailable, GPU stats disabled.");
+			return false;
+		}
+
+		gpu_freqs = read_gpu_freqs();
+		if (gpu_freqs.size() > 1) {
+			gpu_perf_states.assign(gpu_freqs.begin() + 1, gpu_freqs.end());
+		} else {
+			gpu_perf_states = gpu_freqs;
+		}
+
+		gpu_name = detect_gpu_name();
+		gpus.clear();
+		gpus.resize(1);
+		gpu_names.clear();
+		gpu_names.push_back(gpu_name);
+
+		auto& gpu = gpus.front();
+		gpu.pwr_max_usage = default_pwr_ceiling;
+		gpu_pwr_total_max = gpu.pwr_max_usage;
+
+		gpu.supported_functions.gpu_utilization = true;
+		gpu.supported_functions.mem_utilization = false;
+		gpu.supported_functions.gpu_clock = not gpu_perf_states.empty();
+		gpu.supported_functions.mem_clock = false;
+		gpu.supported_functions.pwr_usage = true;
+		gpu.supported_functions.pwr_state = false;
+		gpu.supported_functions.temp_info = false;
+		gpu.supported_functions.mem_total = false;
+		gpu.supported_functions.mem_used = false;
+		gpu.supported_functions.pcie_txrx = false;
+		gpu.supported_functions.encoder_utilization = false;
+		gpu.supported_functions.decoder_utilization = false;
+
+		return true;
+	}
+
+	auto collect(bool no_update) -> vector<gpu_info>& {
+		if (Runner::stopping or (no_update and not gpus.empty())) return gpus;
+		if (gpus.empty()) {
+			if (not init()) return gpus;
+		}
+
+		CFDictionaryRef sample = nullptr;
+		uint64_t elapsed_ms = 0;
+		if (not io_report.next(sample, elapsed_ms)) return gpus;
+		auto sample_guard = std::unique_ptr<const __CFDictionary, decltype(&CFRelease)>(sample, &CFRelease);
+		(void)sample_guard;
+
+		auto* items = static_cast<CFArrayRef>(CFDictionaryGetValue(sample, CFSTR("IOReportChannels")));
+		if (items == nullptr) return gpus;
+
+		auto& gpu = gpus.front();
+		const auto count = CFArrayGetCount(items);
+		for (CFIndex i = 0; i < count; ++i) {
+			auto* item = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(items, i));
+			const auto group = cf_to_string(IOReportChannelGetGroup(item));
+			const auto subgroup = cf_to_string(IOReportChannelGetSubGroup(item));
+			const auto channel = cf_to_string(IOReportChannelGetChannelName(item));
+			const auto unit = cf_to_string(IOReportChannelGetUnitLabel(item));
+
+			if (group == "GPU Stats" and subgroup == "GPU Performance States") {
+				if (channel == "GPUPH") {
+					const auto residencies = get_residencies(item);
+					const auto [freq, percent] = calc_freq(residencies, gpu_perf_states);
+					gpu.gpu_clock_speed = freq;
+					gpu.gpu_percent.at("gpu-totals").push_back(clamp(percent, 0ll, 100ll));
+				}
+			}
+			else if (group == "Energy Model") {
+				if (channel == "GPU Energy") {
+					const auto mw = energy_to_mw(item, unit, elapsed_ms);
+					if (mw >= 0) {
+						gpu.pwr_usage = mw;
+						if (mw > gpu.pwr_max_usage) {
+							gpu.pwr_max_usage = mw;
+							gpu_pwr_total_max = mw;
+						}
+						const auto p = gpu.pwr_max_usage > 0 ? clamp(static_cast<long long>(std::llround((double)mw * 100.0 / (double)gpu.pwr_max_usage)), 0ll, 100ll) : 0ll;
+						gpu.gpu_percent.at("gpu-pwr-totals").push_back(p);
+					}
+				}
+			}
+		}
+
+		if (gpu.gpu_percent.at("gpu-totals").empty()) gpu.gpu_percent.at("gpu-totals").push_back(0);
+		if (gpu.gpu_percent.at("gpu-pwr-totals").empty()) gpu.gpu_percent.at("gpu-pwr-totals").push_back(0);
+
+		if (width != 0) {
+			while (cmp_greater(gpu.gpu_percent.at("gpu-totals").size(), width * 2)) gpu.gpu_percent.at("gpu-totals").pop_front();
+			while (cmp_greater(gpu.gpu_percent.at("gpu-pwr-totals").size(), width)) gpu.gpu_percent.at("gpu-pwr-totals").pop_front();
+			while (cmp_greater(gpu.temp.size(), 18)) gpu.temp.pop_front();
+			while (cmp_greater(gpu.gpu_percent.at("gpu-vram-totals").size(), width / 2)) gpu.gpu_percent.at("gpu-vram-totals").pop_front();
+		}
+
+		long long avg = 0;
+		for (const auto& dev : gpus) {
+			if (not dev.gpu_percent.at("gpu-totals").empty())
+				avg += dev.gpu_percent.at("gpu-totals").back();
+		}
+		if (not gpus.empty()) shared_gpu_percent.at("gpu-average").push_back(avg / gpus.size());
+
+		if (gpu_pwr_total_max > 0) shared_gpu_percent.at("gpu-pwr-total").push_back((gpu.pwr_usage * 100) / gpu_pwr_total_max);
+
+		if (width != 0) {
+			while (cmp_greater(shared_gpu_percent.at("gpu-average").size(), width * 2)) shared_gpu_percent.at("gpu-average").pop_front();
+			while (cmp_greater(shared_gpu_percent.at("gpu-pwr-total").size(), width * 2)) shared_gpu_percent.at("gpu-pwr-total").pop_front();
+			while (cmp_greater(shared_gpu_percent.at("gpu-vram-total").size(), width * 2)) shared_gpu_percent.at("gpu-vram-total").pop_front();
+		}
+
+		return gpus;
+	}
+
+	namespace Nvml {
+		bool shutdown() { return true; }
+	}
+
+	namespace Rsmi {
+		bool shutdown() { return true; }
+	}
+}  // namespace Gpu
+#endif
 
 namespace Mem {
 	double old_uptime;
@@ -180,6 +602,27 @@ namespace Shared {
 		Cpu::cpuName = Cpu::get_cpuName();
 		Cpu::got_sensors = Cpu::get_sensors();
 		Cpu::core_mapping = Cpu::get_core_mapping();
+
+#ifdef GPU_SUPPORT
+		if (Gpu::init() and not Gpu::gpu_names.empty()) {
+			for (const auto& [key, _] : Gpu::gpus[0].gpu_percent) {
+				if (not v_contains(Cpu::available_fields, key)) Cpu::available_fields.push_back(key);
+			}
+			for (const auto& [key, _] : Gpu::shared_gpu_percent) {
+				if (not v_contains(Cpu::available_fields, key)) Cpu::available_fields.push_back(key);
+			}
+
+			using namespace Gpu;
+			count = gpus.size();
+			gpu_b_height_offsets.resize(gpus.size());
+			for (size_t i = 0; i < gpu_b_height_offsets.size(); ++i)
+				gpu_b_height_offsets[i] = gpus[i].supported_functions.gpu_utilization
+					   + gpus[i].supported_functions.pwr_usage
+					   + (gpus[i].supported_functions.encoder_utilization or gpus[i].supported_functions.decoder_utilization)
+					   + (gpus[i].supported_functions.mem_total or gpus[i].supported_functions.mem_used)
+						* (1 + 2*(gpus[i].supported_functions.mem_total and gpus[i].supported_functions.mem_used) + 2*gpus[i].supported_functions.mem_utilization);
+		}
+#endif
 
 		//? Init for namespace Mem
 		Mem::old_uptime = system_uptime();
